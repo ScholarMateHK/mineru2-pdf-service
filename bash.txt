@@ -1,0 +1,17 @@
+客户环境只需要三个文件和一条命令：
+
+
+# 1. 准备文件
+Dockerfile
+api_server.py  
+start.sh
+cd到当前所在目录（如：srv/repo/mineru2-pdf-service）
+
+# 2. 构建运行
+docker build -t mineru-pdf-service:latest .
+# ↑ .是在当前目录找Dockerfile，用当前目录的所有文件作为构建上下文
+docker run --gpus '"device=X"' -p 8007:8080 --shm-size 100g --ipc=host mineru-pdf-service:latest
+# ↑ 运行镜像，把8007端口映射到docker内部的8080端口（fastapi端口），shm-size设置为100g，ipc=host，镜像名是mineru-pdf-service:latest
+
+# 3. 开始使用
+curl -X POST http://localhost:8007/convert -F "file=@document.pdf"
