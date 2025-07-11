@@ -15,16 +15,16 @@ curl http://localhost:8007/health
 
 **系统要求**: NVIDIA GPU (16GB+显存) + 32GB RAM + Docker
 
-## � API使用
+## 📋 API接口
 
-### 基本转换
+### PDF转换接口
 
+**POST /convert** - 上传PDF文件转换为Markdown
 ```bash
 curl -X POST http://localhost:8007/convert -F "file=@document.pdf"
 ```
 
-### 响应格式
-
+响应格式：
 ```json
 {
   "status": "success",
@@ -40,6 +40,25 @@ curl -X POST http://localhost:8007/convert -F "file=@document.pdf"
 ```
 
 **限制**: 单文件最大200MB，支持8个并发请求
+
+### 其他接口
+
+**GET /health** - 健康检查 | **GET /** - 服务信息
+
+### 🔄 从mineru1微服务迁移
+
+如果你的微服务之前使用 `response.get("text")`，现在需要改为：
+
+```python
+# 适配新版本响应格式
+response_data = response.json()
+if response_data.get("status") == "success" and "data" in response_data:
+    markdown_content = response_data["data"]["markdown"]
+    metadata = response_data["data"]["metadata"]
+else:
+    # 兼容旧版本格式
+    markdown_content = response_data.get("text")
+```
 
 ## 💻 集成示例
 
