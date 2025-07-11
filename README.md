@@ -163,4 +163,4 @@ docker update --restart=always mineru-pdf-service
 
 ---
 
-*最后更新: 2025-07-10*
+*最后更新: 2025-07-11*
