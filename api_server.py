@@ -2,12 +2,15 @@ import os
 import time
 import tempfile
 import shutil
+import requests
+import threading
 from typing import Dict, Any
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 import uvicorn
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import logging
 
 from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
 from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
@@ -21,51 +24,116 @@ app = FastAPI(
     description="High-performance PDF to Markdown conversion service"
 )
 
-# 线程池用于CPU密集型任务
-executor = ThreadPoolExecutor(max_workers=8)
+# 线程池用于CPU密集型任务 - 最保守的稳定配置
+executor = ThreadPoolExecutor(max_workers=2)
+
+# PDF预处理互斥锁 - 防止并发时的资源竞争
+pdf_processing_lock = threading.Lock()
+
+# VLM服务并发限制 - 防止VLM服务过载
+vlm_semaphore = threading.Semaphore(2)  # 最多2个并发VLM请求
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def check_vlm_service():
+    """检查VLM服务是否健康"""
+    try:
+        response = requests.get("http://localhost:80/health", timeout=5)
+        return response.status_code == 200
+    except:
+        return False
+
+def wait_for_vlm_service(max_wait=60):
+    """等待VLM服务恢复"""
+    logger.info("Waiting for VLM service to recover...")
+    start_time = time.time()
+    while time.time() - start_time < max_wait:
+        if check_vlm_service():
+            logger.info("VLM service is healthy again")
+            return True
+        time.sleep(2)
+    logger.error("VLM service did not recover within timeout")
+    return False
 
 def process_pdf_to_markdown(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
     """
-    核心PDF处理函数 - 只返回markdown内容，不保存文件
+    核心PDF处理函数 - 只返回markdown内容，不保存文件，带重试机制
     """
+    import threading
+    thread_id = threading.current_thread().ident
+    logger.info(f"[Thread {thread_id}] Starting processing {filename}")
+
     start_time = time.time()
     temp_dir = None
-    
+    max_retries = 2
+
     try:
-        # 创建临时目录
-        temp_dir = tempfile.mkdtemp()
-        
-        # PDF预处理
-        pdf_file_name = filename.replace('.pdf', '').replace(' ', '_')
-        processed_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes, 0, None)
-        
-        # 准备临时环境（不保存到永久位置）
-        local_image_dir, local_md_dir = prepare_env(temp_dir, pdf_file_name, 'auto')
-        image_writer = FileBasedDataWriter(local_image_dir)
-        
-        # VLM分析
-        middle_json, infer_result = vlm_doc_analyze(
-            processed_pdf_bytes, 
-            image_writer=image_writer, 
-            backend='sglang-client',
-            server_url='http://localhost:80'
-        )
-        
-        # 生成markdown（内存中处理，不写文件）
-        pdf_info = middle_json["pdf_info"]
-        image_dir = str(os.path.basename(local_image_dir))
-        markdown_content = vlm_union_make(pdf_info, MakeMode.MM_MD, image_dir)
-        
-        processing_time = time.time() - start_time
-        
-        return {
-            "success": True,
-            "markdown": markdown_content,
-            "pages": len(pdf_info),
-            "processing_time_seconds": round(processing_time, 2),
-            "filename": filename
-        }
-        
+        for attempt in range(max_retries + 1):
+            try:
+                # 检查VLM服务状态
+                if not check_vlm_service():
+                    logger.warning(f"VLM service unhealthy on attempt {attempt + 1}")
+                    if attempt < max_retries:
+                        wait_for_vlm_service()
+                        continue
+                    else:
+                        raise Exception("VLM service is unavailable after retries")
+
+                # 创建临时目录
+                if temp_dir is None:
+                    temp_dir = tempfile.mkdtemp()
+
+                # PDF预处理 - 使用互斥锁防止并发竞争
+                logger.info(f"[Thread {thread_id}] Acquiring PDF processing lock for {filename}")
+                with pdf_processing_lock:
+                    logger.info(f"[Thread {thread_id}] PDF processing lock acquired for {filename}")
+                    pdf_file_name = filename.replace('.pdf', '').replace(' ', '_')
+                    processed_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes, 0, None)
+                    logger.info(f"[Thread {thread_id}] PDF preprocessing completed for {filename}")
+
+                # 准备临时环境（不保存到永久位置）
+                local_image_dir, _ = prepare_env(temp_dir, pdf_file_name, 'auto')
+                image_writer = FileBasedDataWriter(local_image_dir)
+
+                # VLM分析 - 使用信号量限制并发数
+                logger.info(f"[Thread {thread_id}] Acquiring VLM semaphore for {filename}")
+                with vlm_semaphore:
+                    logger.info(f"[Thread {thread_id}] VLM semaphore acquired, calling VLM service for {filename}")
+                    middle_json, _ = vlm_doc_analyze(
+                        processed_pdf_bytes,
+                        image_writer=image_writer,
+                        backend='sglang-client',
+                        server_url='http://localhost:80'
+                    )
+                    logger.info(f"[Thread {thread_id}] VLM analysis completed for {filename}")
+
+                # 生成markdown（内存中处理，不写文件）
+                pdf_info = middle_json["pdf_info"]
+                image_dir = str(os.path.basename(local_image_dir))
+                markdown_content = vlm_union_make(pdf_info, MakeMode.MM_MD, image_dir)
+
+                processing_time = time.time() - start_time
+
+                return {
+                    "success": True,
+                    "markdown": markdown_content,
+                    "pages": len(pdf_info),
+                    "processing_time_seconds": round(processing_time, 2),
+                    "filename": filename
+                }
+
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
+                if attempt < max_retries:
+                    logger.info(f"Retrying... ({attempt + 1}/{max_retries})")
+                    time.sleep(2)  # 等待2秒再重试
+                    continue
+                else:
+                    # 最后一次尝试失败
+                    raise e
+
     except Exception as e:
         return {
             "success": False,
@@ -73,7 +141,7 @@ def process_pdf_to_markdown(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
             "processing_time_seconds": round(time.time() - start_time, 2),
             "filename": filename
         }
-    
+
     finally:
         # 清理临时文件
         if temp_dir and os.path.exists(temp_dir):
@@ -116,13 +184,15 @@ async def convert_pdf_to_markdown(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Empty file uploaded.")
         
         # 异步处理（避免阻塞其他请求）
+        logger.info(f"Submitting {file.filename} to thread pool (active threads: {executor._threads})")
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            executor, 
-            process_pdf_to_markdown, 
-            pdf_content, 
+            executor,
+            process_pdf_to_markdown,
+            pdf_content,
             file.filename
         )
+        logger.info(f"Completed processing {file.filename}")
         
         if result["success"]:
             return JSONResponse(
@@ -161,12 +231,16 @@ async def health_check():
         import requests
         response = requests.get("http://localhost:80/health", timeout=5)
         vlm_healthy = response.status_code == 200
-    except:
+        vlm_response_time = response.elapsed.total_seconds() if vlm_healthy else None
+    except Exception as e:
         vlm_healthy = False
-    
+        vlm_response_time = None
+
     return {
         "status": "healthy" if vlm_healthy else "degraded",
         "vlm_service": "available" if vlm_healthy else "unavailable",
+        "vlm_response_time_seconds": vlm_response_time,
+        "max_concurrent_workers": 2,
         "service": "MinerU PDF to Markdown Converter"
     }
 
