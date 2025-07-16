@@ -7,7 +7,7 @@ echo "Starting sglang VLM service on port 80..."
 mineru-sglang-server \
     --host 0.0.0.0 \
     --port 80 \
-    --mem-fraction-static 0.4 &
+    --mem-fraction-static 0.5 &
 
 # Wait for sglang to start
 echo "Waiting for sglang service to initialize..."
